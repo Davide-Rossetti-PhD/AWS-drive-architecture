@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Data files (too large for git)
+data/*.csv
+!data/sample_data.csv
+*.xlsx
+*.xls
+*.parquet
+*.db
+*.sqlite
+
+# Environment
+.env
+.env.local
+.venv/
+venv/
+env/
+
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
+# OS
+.DS_Store
+Thumbs.db
+~$*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.bak
+*.log
