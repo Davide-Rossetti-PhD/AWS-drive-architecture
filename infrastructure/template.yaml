@@ -1,0 +1,512 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SEW Drive Monitoring - Serverless IoT pipeline for real-time motor
+  telemetry collection, storage, and anomaly alerting.
+  Site: SITE-XXX Industrial Facility (Location, Country)
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  
+  SiteId:
+    Type: String
+    Default: SITE-XXX
+    Description: Site identifier for multi-site deployments
+  
+  DynamoDBTTLDays:
+    Type: Number
+    Default: 7
+    Description: Days to retain live data in DynamoDB before auto-expiry
+  
+  AlertStateTTLHours:
+    Type: Number
+    Default: 48
+    Description: Hours to retain anti-spam alert state records
+  
+  ThresholdCacheTTLSeconds:
+    Type: Number
+    Default: 300
+    Description: Seconds to cache threshold config in Lambda memory
+  
+  ParquetFlushIntervalSeconds:
+    Type: Number
+    Default: 300
+    Description: Seconds between Parquet file flushes to S3
+  
+  SlackWebhookSecretName:
+    Type: String
+    Default: sew-slack-webhook
+    Description: Name of the Secrets Manager secret containing the Slack webhook URL
+  
+  MQTTTopicPrefix:
+    Type: String
+    Default: sew/SITE-XXX
+    Description: MQTT topic prefix (sew/{SiteId})
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 60
+    MemorySize: 512
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        SITE_ID: !Ref SiteId
+        MOTORS_TABLE: !Ref SEWMotorsTable
+        CONFIG_TABLE: !Ref SEWConfigTable
+        ALERT_STATE_TABLE: !Ref SEWAlertStateTable
+        DATA_BUCKET: !Ref SEWDataBucket
+        ALERT_TOPIC_ARN: !Ref SEWAlertsTopic
+        TTL_DAYS: !Ref DynamoDBTTLDays
+        THRESHOLD_CACHE_TTL: !Ref ThresholdCacheTTLSeconds
+        PARQUET_FLUSH_INTERVAL: !Ref ParquetFlushIntervalSeconds
+
+# ============================================================
+# RESOURCES
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # SQS: Telemetry Queue + Dead Letter Queue
+  # ----------------------------------------------------------
+  SEWTelemetryDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub sew-telemetry-dlq-${Environment}
+      MessageRetentionPeriod: 1209600  # 14 days
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Project
+          Value: SEW-Monitoring
+        - Key: Environment
+          Value: !Ref Environment
+
+  SEWTelemetryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub sew-telemetry-queue-${Environment}
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 345600  # 4 days
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SEWTelemetryDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: SEW-Monitoring
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SQS Policy: allow IoT Core to send messages
+  SEWTelemetryQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SEWTelemetryQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt SEWTelemetryQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rule/SEWTelemetryRule*
+
+  # ----------------------------------------------------------
+  # IoT Core: Topic Rule -> SQS (with S3 error action)
+  # ----------------------------------------------------------
+  SEWIoTRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub SEWTelemetryRule_${Environment}
+      TopicRulePayload:
+        Sql: !Sub "SELECT *, topic(3) AS cabinet_id, timestamp() AS ingestion_ts FROM '${MQTTTopicPrefix}/+/telemetry'"
+        AwsIotSqlVersion: '2016-03-23'
+        Actions:
+          - Sqs:
+              QueueUrl: !Ref SEWTelemetryQueue
+              RoleArn: !GetAtt SEWIoTRuleRole.Arn
+              UseBase64: false
+        ErrorAction:
+          S3:
+            BucketName: !Ref SEWDataBucket
+            Key: !Sub "error-fallback/${SiteId}/${!timestamp()}.json"
+            RoleArn: !GetAtt SEWIoTRuleRole.Arn
+
+  SEWIoTRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub sew-iot-rule-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IoTRulePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SEWTelemetryQueue.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${SEWDataBucket.Arn}/error-fallback/*
+
+  # ----------------------------------------------------------
+  # DynamoDB: SEW-Motors (live data, 7-day TTL)
+  # ----------------------------------------------------------
+  SEWMotorsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub SEW-Motors-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: motor_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ByMotor
+          KeySchema:
+            - AttributeName: motor_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: SEW-Monitoring
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------
+  # DynamoDB: SEW-Config (thresholds)
+  # ----------------------------------------------------------
+  SEWConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub SEW-Config-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: SEW-Monitoring
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------
+  # DynamoDB: SEW-AlertState (anti-spam tracking)
+  # ----------------------------------------------------------
+  SEWAlertStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub SEW-AlertState-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: SEW-Monitoring
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------
+  # S3: Data Bucket (Parquet archive + error fallback)
+  # ----------------------------------------------------------
+  SEWDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub sew-data-${SiteId}-${Environment}-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldData
+            Status: Enabled
+            Prefix: cabinet=
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
+          - Id: CleanupErrorFallback
+            Status: Enabled
+            Prefix: error-fallback/
+            ExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: SEW-Monitoring
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------
+  # SNS: Alert Topic
+  # ----------------------------------------------------------
+  SEWAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub sew-alerts-${Environment}
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: SEW-Monitoring
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------
+  # Lambda: Ingest & Alert Engine
+  # ----------------------------------------------------------
+  SEWIngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sew-ingest-and-alert-${Environment}
+      Handler: handler.handler
+      CodeUri: functions/sew-ingest-and-alert/
+      MemorySize: 512
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SEWTelemetryQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+      Policies:
+        # DynamoDB: write motors + read/write alert state + read config
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SEWMotorsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SEWAlertStateTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref SEWConfigTable
+        # S3: write Parquet files
+        - S3WritePolicy:
+            BucketName: !Ref SEWDataBucket
+        # SNS: publish alerts
+        - SNSPublishMessagePolicy:
+            TopicArn: !Ref SEWAlertsTopic
+      Tags:
+        Project: SEW-Monitoring
+        Environment: !Ref Environment
+
+  # ----------------------------------------------------------
+  # Lambda: Slack Notification
+  # ----------------------------------------------------------
+  SEWSlackNotifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub sew-slack-notify-${Environment}
+      Handler: handler.handler
+      CodeUri: functions/sew-slack-notify/
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_SECRET: !Ref SlackWebhookSecretName
+      Events:
+        SNSTrigger:
+          Type: SNS
+          Properties:
+            Topic: !Ref SEWAlertsTopic
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SlackWebhookSecretName}-*
+      Tags:
+        Project: SEW-Monitoring
+        Environment: !Ref Environment
+
+  # ----------------------------------------------------------
+  # CloudWatch Alarms: Infrastructure Monitoring
+  # ----------------------------------------------------------
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sew-dlq-not-empty-${Environment}
+      AlarmDescription: Messages in the Dead Letter Queue - investigate Lambda failures
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SEWTelemetryDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SEWAlertsTopic
+
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sew-queue-age-high-${Environment}
+      AlarmDescription: SQS messages are not being processed fast enough
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SEWTelemetryQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 60
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SEWAlertsTopic
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sew-lambda-errors-${Environment}
+      AlarmDescription: Ingest Lambda is throwing errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SEWIngestFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SEWAlertsTopic
+
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sew-lambda-throttles-${Environment}
+      AlarmDescription: Ingest Lambda is being throttled - increase concurrency
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SEWIngestFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SEWAlertsTopic
+
+  IoTRuleFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sew-iot-rule-failures-${Environment}
+      AlarmDescription: IoT Rule failed to deliver to SQS
+      Namespace: AWS/IoT
+      MetricName: RuleMessageThrottled
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SEWAlertsTopic
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+Outputs:
+  IoTEndpoint:
+    Description: IoT Core MQTT endpoint (configure on Cisco modules)
+    Value: !Sub "Use: aws iot describe-endpoint --endpoint-type iot:Data-ATS"
+
+  TelemetryQueueUrl:
+    Description: SQS queue URL for telemetry messages
+    Value: !Ref SEWTelemetryQueue
+
+  DataBucketName:
+    Description: S3 bucket for Parquet archive and error fallback
+    Value: !Ref SEWDataBucket
+
+  MotorsTableName:
+    Description: DynamoDB table for live motor data (7-day TTL)
+    Value: !Ref SEWMotorsTable
+
+  ConfigTableName:
+    Description: DynamoDB table for threshold configuration
+    Value: !Ref SEWConfigTable
+
+  AlertTopicArn:
+    Description: SNS topic ARN for alerts
+    Value: !Ref SEWAlertsTopic
+
+  MQTTTopicPattern:
+    Description: MQTT topic pattern for publishing telemetry
+    Value: !Sub "${MQTTTopicPrefix}/{cabinet_id}/telemetry"
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost (500 motors, 10 cabinets, no VPN)
+    Value: "~$67/month | ~$800/year | $0.13/motor/month"
